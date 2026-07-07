@@ -47,6 +47,31 @@ function emailOnCooldown(email, now) {
   return prev !== undefined && now - prev < EMAIL_COOLDOWN_MS;
 }
 
+// Per-IP rate limit, in addition to the per-address cooldown above. The
+// per-address cooldown alone can't stop an attacker who walks a list of victim
+// addresses from one host — every address is "new", so each request passes. This
+// caps how many /email/start sends a single client IP (x-forwarded-for first
+// hop) can trigger inside a short window, blunting inbox-bombing / Resend-quota
+// burn. Same caveat as the cooldown: this is PER-INSTANCE / best-effort only —
+// serverless instances don't share this map and it resets on cold start, so it
+// only stops a single-process flood. Durable cross-instance limiting needs a
+// shared KV/edge limiter; tracked as a follow-up.
+const IP_WINDOW_MS = 60 * 1000;
+const IP_MAX_PER_WINDOW = 5;
+const ipHits = new Map();
+function ipRateLimited(ip, now) {
+  if (!ip) return false; // no usable client IP — lean on the per-address cooldown
+  // Opportunistic prune so the map can't grow unbounded on a long-lived instance.
+  if (ipHits.size > 5000) {
+    for (const [k, hits] of ipHits) if (!hits.some((t) => now - t < IP_WINDOW_MS)) ipHits.delete(k);
+  }
+  const recent = (ipHits.get(ip) || []).filter((t) => now - t < IP_WINDOW_MS);
+  ipHits.set(ip, recent);
+  if (recent.length >= IP_MAX_PER_WINDOW) return true;
+  recent.push(now);
+  return false;
+}
+
 // ─── origin allowlist ─────────────────────────────────────────────────────────
 
 /**
@@ -146,7 +171,7 @@ export async function routeCallback(env, { provider, query, cookieHeader, redire
 }
 
 /** Magic-link start: mint a token for { email, provider: 'email' } and send it via Resend. */
-export async function routeEmailStart(env, body) {
+export async function routeEmailStart(env, body, ip) {
   const email = typeof body?.email === 'string' ? body.email.trim() : '';
   const origin = body?.origin;
   if (!isAllowedOrigin(origin, env)) return { status: 403, json: { error: 'origin is not allowlisted' } };
@@ -159,6 +184,11 @@ export async function routeEmailStart(env, body) {
   // this can't be used to probe which addresses were recently requested.
   const now = Date.now();
   if (emailOnCooldown(email, now)) return { status: 200, json: { sent: true } };
+  // Then cap total sends per client IP so one host can't email-bomb a whole list
+  // of distinct addresses (each of which sails past the per-address cooldown).
+  // Checked after the cooldown so repeat requests for one address don't burn the
+  // IP budget. An attacker hitting this is fine to tell — no victim info leaks.
+  if (ipRateLimited(ip, now)) return { status: 429, json: { error: 'too many requests, please try again shortly' } };
   lastEmailAt.set(email, now);
   // The lifetime choice rides the token itself: the magic link may be opened
   // long after this request (even in another tab), so a POST-body `days` at
@@ -187,6 +217,15 @@ export async function routeEmailStart(env, body) {
 }
 
 // ─── plumbing ─────────────────────────────────────────────────────────────────
+
+// The client IP for per-IP rate limiting: the x-forwarded-for FIRST hop (the
+// original client as seen by the edge/proxy), falling back to the socket peer
+// for the local/test path. Best-effort — a spoofed XFF only lets a caller widen
+// their own budget, and the per-address cooldown still applies.
+function clientIp(req) {
+  const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+  return xff || req.socket?.remoteAddress || '';
+}
 
 function parseCookies(header) {
   const out = {};
@@ -269,7 +308,7 @@ async function route(env, req, url, path) {
     } catch (err) {
       return { status: err.statusCode || 400, json: { error: err.message } };
     }
-    return path === '/api/ca/enroll' ? enroll(body || {}, env) : routeEmailStart(env, body || {});
+    return path === '/api/ca/enroll' ? enroll(body || {}, env) : routeEmailStart(env, body || {}, clientIp(req));
   }
   return { status: 404, json: { error: 'not found' } };
 }
