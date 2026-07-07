@@ -1,0 +1,304 @@
+// SPDX-License-Identifier: MPL-2.0
+/**
+ * The Lolly CA HTTP handler — one (req, res) function that runs three ways:
+ * `node services/ca/server.mjs` locally, api/ca/[...path].js on Vercel, and
+ * imported by tests (route logic is exported per-route so pure results are
+ * testable without a socket).
+ *
+ * Routing is always on the full /api/ca/... path — the Vite dev proxy
+ * preserves the prefix and Vercel mounts the function there:
+ *
+ *   GET  /api/ca/health
+ *   GET  /api/ca/root.pem
+ *   GET  /api/ca/auth/:provider?origin=
+ *   GET  /api/ca/callback/:provider?code&state
+ *   POST /api/ca/email/start   { email, origin }
+ *   POST /api/ca/enroll        { token, spki, pop, days? }
+ *
+ * Route functions return { status, headers?, json? | body?, type? } and
+ * writeResult() serialises — no res access inside route logic.
+ */
+
+import { buildAuthorizeUrl, configuredProviders, fetchVerifiedEmail, looksLikeEmail, OAUTH_PROVIDERS } from './lib/oidc.mjs';
+import { mintEnrollToken, randomB64u, signValue, verifyValue } from './lib/tokens.mjs';
+import { completionPage, errorPage } from './lib/pages.mjs';
+import { enroll } from './lib/enroll.mjs';
+
+const STATE_COOKIE = 'lolly_ca_state';
+const STATE_TTL_SECONDS = 600;
+const BODY_CAP = 64 * 1024;
+const STATE_TYP = 'lolly-ca/state'; // domain-separation tag (see tokens.mjs TOKEN_TYP)
+
+// Best-effort per-address magic-link cooldown. /api/ca/email/start dispatches a
+// real email to whatever (allowlisted-origin) caller asks, so an unauthenticated
+// loop could spam an inbox / burn the Resend quota. A warm-instance in-memory
+// map collapses repeats to one send per address per window. This is NOT a hard
+// limit (serverless instances aren't shared, and it resets on cold start) — real
+// rate limiting needs a durable KV/edge limiter; tracked as a follow-up. It does
+// stop the trivial single-process flood and is free. Belt: Resend's own limits.
+const EMAIL_COOLDOWN_MS = 60 * 1000;
+const lastEmailAt = new Map();
+function emailOnCooldown(email, now) {
+  // Opportunistic prune so the map can't grow unbounded on a long-lived instance.
+  if (lastEmailAt.size > 5000) {
+    for (const [k, t] of lastEmailAt) if (now - t > EMAIL_COOLDOWN_MS) lastEmailAt.delete(k);
+  }
+  const prev = lastEmailAt.get(email);
+  return prev !== undefined && now - prev < EMAIL_COOLDOWN_MS;
+}
+
+// ─── origin allowlist ─────────────────────────────────────────────────────────
+
+/**
+ * The popup/postMessage target and magic-link base must be ours. This is a
+ * security check on the origin/redirect PARAMS, not CORS — the app is
+ * same-origin with the service in both dev (Vite proxy) and prod (Vercel).
+ * With the dev fake provider on, any http://localhost:* origin is allowed so
+ * local setups need no env.
+ */
+export function isAllowedOrigin(origin, env) {
+  if (!origin || typeof origin !== 'string') return false;
+  const list = String(env.CA_ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (list.includes(origin)) return true;
+  if (env.CA_DEV_FAKE_PROVIDER === '1' && /^http:\/\/localhost(:\d+)?$/.test(origin)) return true;
+  return false;
+}
+
+// ─── routes ───────────────────────────────────────────────────────────────────
+
+export function routeHealth(env) {
+  return {
+    status: 200,
+    json: {
+      ok: true,
+      devProvider: env.CA_DEV_FAKE_PROVIDER === '1',
+      configured: configuredProviders(env),
+    },
+  };
+}
+
+export function routeRootPem(env) {
+  if (!env.CA_ROOT_CERT_PEM) {
+    return { status: 404, body: 'CA root certificate is not configured on this deployment\n', type: 'text/plain; charset=utf-8' };
+  }
+  return { status: 200, body: `${String(env.CA_ROOT_CERT_PEM).trim()}\n`, type: 'text/plain; charset=utf-8' };
+}
+
+const stateCookie = (value, redirectUri, maxAge = STATE_TTL_SECONDS) =>
+  `${STATE_COOKIE}=${value}; Max-Age=${maxAge}; Path=/api/ca; HttpOnly; SameSite=Lax${String(redirectUri).startsWith('https') ? '; Secure' : ''}`;
+
+/**
+ * Start OIDC. 'dev' (only with CA_DEV_FAKE_PROVIDER=1) skips OAuth entirely
+ * and answers with the completion page for dev@example.com; real providers
+ * get a signed HttpOnly state cookie and a 302 to their authorize URL.
+ */
+export async function routeAuth(env, { provider, origin, redirectUri }) {
+  if (!isAllowedOrigin(origin, env)) return { status: 403, json: { error: 'origin is not allowlisted' } };
+  if (provider === 'dev') {
+    if (env.CA_DEV_FAKE_PROVIDER !== '1') return { status: 404, json: { error: 'unknown provider' } };
+    const token = await mintEnrollToken({ email: 'dev@example.com', provider: 'dev' }, env.CA_SERVICE_SECRET);
+    return { status: 200, body: completionPage({ token, origin }), type: 'text/html; charset=utf-8' };
+  }
+  if (!OAUTH_PROVIDERS.includes(provider)) return { status: 404, json: { error: 'unknown provider' } };
+  if (!configuredProviders(env)[provider]) return { status: 501, json: { error: `${provider} sign-in is not configured on this deployment` } };
+  const nonce = randomB64u(24); // doubles as the OAuth state param + OIDC nonce claim
+  const pkceVerifier = randomB64u(48); // 64 chars — inside RFC 7636's 43–128
+  const state = { typ: STATE_TYP, provider, origin, pkceVerifier, nonce, exp: Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS };
+  const location = await buildAuthorizeUrl(provider, env, { redirectUri, state: nonce, nonce, pkceVerifier });
+  return {
+    status: 302,
+    headers: {
+      location,
+      'set-cookie': stateCookie(await signValue(state, env.CA_SERVICE_SECRET), redirectUri),
+    },
+  };
+}
+
+/**
+ * Finish OIDC: state cookie must verify, match the provider and the echoed
+ * state param, and still be fresh; then the code is exchanged server-side
+ * for a VERIFIED email, which becomes a 10-minute enrollment token handed to
+ * the opener via postMessage. Failures render a human-readable page — this
+ * runs in a popup, not an API client.
+ */
+export async function routeCallback(env, { provider, query, cookieHeader, redirectUri }) {
+  const clear = { 'set-cookie': stateCookie('', redirectUri, 0) };
+  const fail = (status, message) => ({ status, body: errorPage(message), type: 'text/html; charset=utf-8', headers: clear });
+  const state = await verifyValue(parseCookies(cookieHeader)[STATE_COOKIE], env.CA_SERVICE_SECRET);
+  if (!state || state.typ !== STATE_TYP) return fail(401, 'The sign-in state is missing or invalid. Start again from Lolly.');
+  if (typeof state.exp !== 'number' || state.exp * 1000 < Date.now()) return fail(401, 'The sign-in attempt expired — it only lives 10 minutes.');
+  if (state.provider !== provider) return fail(400, 'The sign-in state does not match this provider.');
+  if (!query.state || query.state !== state.nonce) return fail(400, 'The sign-in state does not match this browser.');
+  if (!query.code) return fail(400, query.error_description || query.error || 'The provider returned no authorization code.');
+  let email;
+  try {
+    email = await fetchVerifiedEmail(provider, env, {
+      code: query.code,
+      redirectUri,
+      pkceVerifier: state.pkceVerifier,
+      nonce: state.nonce,
+    });
+  } catch (err) {
+    return fail(401, err?.message || 'Could not verify your email with the provider.');
+  }
+  const token = await mintEnrollToken({ email, provider }, env.CA_SERVICE_SECRET);
+  return { status: 200, body: completionPage({ token, origin: state.origin }), type: 'text/html; charset=utf-8', headers: clear };
+}
+
+/** Magic-link start: mint a token for { email, provider: 'email' } and send it via Resend. */
+export async function routeEmailStart(env, body) {
+  const email = typeof body?.email === 'string' ? body.email.trim() : '';
+  const origin = body?.origin;
+  if (!isAllowedOrigin(origin, env)) return { status: 403, json: { error: 'origin is not allowlisted' } };
+  if (!looksLikeEmail(email)) return { status: 400, json: { error: 'invalid email address' } };
+  if (!env.RESEND_API_KEY || !env.EMAIL_FROM) {
+    return { status: 501, json: { error: 'email sign-in is not configured on this deployment (RESEND_API_KEY / EMAIL_FROM)' } };
+  }
+  // Collapse repeat requests for the same address to one send per window. Return
+  // the normal success shape (never reveal whether a mail actually went out) so
+  // this can't be used to probe which addresses were recently requested.
+  const now = Date.now();
+  if (emailOnCooldown(email, now)) return { status: 200, json: { sent: true } };
+  lastEmailAt.set(email, now);
+  // The lifetime choice rides the token itself: the magic link may be opened
+  // long after this request (even in another tab), so a POST-body `days` at
+  // /enroll time would be lost. leafDays() clamps it at issuance either way.
+  const days = Number(body?.days);
+  const token = await mintEnrollToken(
+    { email, provider: 'email', ...(Number.isFinite(days) ? { days } : {}) },
+    env.CA_SERVICE_SECRET,
+  );
+  const link = `${origin}/#/profile?enrollToken=${encodeURIComponent(token)}`;
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${env.RESEND_API_KEY}`, 'content-type': 'application/json' },
+    body: JSON.stringify({
+      from: env.EMAIL_FROM,
+      to: [email],
+      subject: 'Verify your email for Lolly Content Credentials',
+      text: `Open this link in the browser where Lolly is open (it expires in 10 minutes):\n\n${link}\n\nIf you didn't request this, ignore this email.`,
+    }),
+  });
+  if (!res.ok) {
+    console.error('resend send failed:', res.status, (await res.text().catch(() => '')).slice(0, 300));
+    return { status: 502, json: { error: 'sending the verification email failed' } };
+  }
+  return { status: 200, json: { sent: true } };
+}
+
+// ─── plumbing ─────────────────────────────────────────────────────────────────
+
+function parseCookies(header) {
+  const out = {};
+  for (const part of String(header || '').split(/;\s*/)) {
+    const i = part.indexOf('=');
+    if (i > 0) out[part.slice(0, i)] = part.slice(i + 1);
+  }
+  return out;
+}
+
+// https://host/api/ca/callback/:provider from the request itself. Behind the
+// Vite proxy the Host header is the Vite origin — correct, because the popup
+// goes through the proxy too. Vercel sets x-forwarded-proto.
+function redirectUriFor(req, provider) {
+  const host = String(req.headers.host || 'localhost');
+  const forwarded = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  const proto = forwarded || (/^(localhost|127\.)/.test(host) ? 'http' : 'https');
+  return `${proto}://${host}/api/ca/callback/${provider}`;
+}
+
+// JSON body with a 64 KB cap. Vercel's Node helpers may have pre-parsed the
+// body onto req.body; the raw-stream path covers server.mjs and tests.
+async function readJsonBody(req) {
+  if (req.body !== undefined && req.body !== null) {
+    if (Buffer.isBuffer(req.body) || typeof req.body === 'string') {
+      try { return JSON.parse(String(req.body)); } catch { return null; }
+    }
+    return req.body;
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > BODY_CAP) throw Object.assign(new Error('request body too large'), { statusCode: 413 });
+    chunks.push(chunk);
+  }
+  try { return JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null'); } catch { return null; }
+}
+
+function writeResult(res, result, cors = {}) {
+  const headers = { ...cors, ...(result.headers || {}) };
+  let body;
+  if (result.json !== undefined) {
+    headers['content-type'] = 'application/json; charset=utf-8';
+    body = JSON.stringify(result.json);
+  } else {
+    headers['content-type'] = result.type || 'text/html; charset=utf-8';
+    body = result.body || '';
+  }
+  if (!headers['cache-control']) headers['cache-control'] = 'no-store';
+  res.writeHead(result.status, headers);
+  res.end(body);
+}
+
+async function route(env, req, url, path) {
+  const m = req.method;
+  if (m === 'GET' && path === '/api/ca/health') return routeHealth(env);
+  if (m === 'GET' && path === '/api/ca/root.pem') return routeRootPem(env);
+  const auth = m === 'GET' && path.match(/^\/api\/ca\/auth\/([a-z0-9_-]+)$/);
+  if (auth) {
+    return routeAuth(env, {
+      provider: auth[1],
+      origin: url.searchParams.get('origin'),
+      redirectUri: redirectUriFor(req, auth[1]),
+    });
+  }
+  const cb = m === 'GET' && path.match(/^\/api\/ca\/callback\/([a-z0-9_-]+)$/);
+  if (cb) {
+    return routeCallback(env, {
+      provider: cb[1],
+      query: Object.fromEntries(url.searchParams),
+      cookieHeader: req.headers.cookie,
+      redirectUri: redirectUriFor(req, cb[1]),
+    });
+  }
+  if (m === 'POST' && (path === '/api/ca/email/start' || path === '/api/ca/enroll')) {
+    let body;
+    try {
+      body = await readJsonBody(req);
+    } catch (err) {
+      return { status: err.statusCode || 400, json: { error: err.message } };
+    }
+    return path === '/api/ca/enroll' ? enroll(body || {}, env) : routeEmailStart(env, body || {});
+  }
+  return { status: 404, json: { error: 'not found' } };
+}
+
+/** Build the Node (req, res) handler over a given env (process.env by default). */
+export function createCaHandler(env = process.env) {
+  return async function caHandler(req, res) {
+    try {
+      const url = new URL(req.url, 'http://internal');
+      const path = url.pathname.replace(/\/+$/, '') || '/';
+      // Belt-and-braces CORS: same-origin in practice, so only allowlisted
+      // origins are ever echoed. The origin/redirect PARAM checks above are
+      // the real gate.
+      const requestOrigin = req.headers.origin;
+      const cors = isAllowedOrigin(requestOrigin, env)
+        ? { 'access-control-allow-origin': requestOrigin, vary: 'Origin' }
+        : {};
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204, { ...cors, 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type' });
+        res.end();
+        return;
+      }
+      writeResult(res, await route(env, req, url, path), cors);
+    } catch (err) {
+      console.error('ca handler error:', err);
+      try {
+        res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'internal error' }));
+      } catch { /* headers already sent */ }
+    }
+  };
+}
