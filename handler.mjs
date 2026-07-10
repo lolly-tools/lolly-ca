@@ -315,10 +315,21 @@ async function route(env, req, url, path) {
 
 /** Build the Node (req, res) handler over a given env (process.env by default). */
 export function createCaHandler(env = process.env) {
+  // Is the CA configured to actually run on THIS deployment? It needs its
+  // service secret and/or root key. A deployment with neither — e.g. the
+  // blank-brand site (lolly.art), which carries no CA_* secrets — should not
+  // serve a CA surface (health/root.pem/enroll) that can only dead-end; 404
+  // every route so the endpoint cleanly doesn't exist.
+  const caEnabled = !!(env.CA_SERVICE_SECRET || env.CA_ROOT_KEY_PEM);
   return async function caHandler(req, res) {
     try {
       const url = new URL(req.url, 'http://internal');
       const path = url.pathname.replace(/\/+$/, '') || '/';
+      if (!caEnabled) {
+        res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ error: 'not_found' }));
+        return;
+      }
       // Belt-and-braces CORS: same-origin in practice, so only allowlisted
       // origins are ever echoed. The origin/redirect PARAM checks above are
       // the real gate.
