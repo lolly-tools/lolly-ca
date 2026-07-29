@@ -210,7 +210,10 @@ export async function routeEmailStart(env, body, ip) {
     }),
   });
   if (!res.ok) {
-    console.error('resend send failed:', res.status, (await res.text().catch(() => '')).slice(0, 300));
+    // Status only. The provider's error body echoes the recipient address back,
+    // so logging it would put the very email we're trying not to retain into the
+    // host's function logs on every bounced send.
+    console.error('verification email send failed, status', res.status);
     return { status: 502, json: { error: 'sending the verification email failed' } };
   }
   return { status: 200, json: { sent: true } };
@@ -344,7 +347,9 @@ export function createCaHandler(env = process.env) {
       }
       writeResult(res, await route(env, req, url, path), cors);
     } catch (err) {
-      console.error('ca handler error:', err);
+      // Message only, never the error object: a stack or a fetch error can carry
+      // the request URL, and enrollment URLs contain a single-use token.
+      console.error('ca handler error:', err?.message || 'unknown');
       try {
         res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ error: 'internal error' }));
