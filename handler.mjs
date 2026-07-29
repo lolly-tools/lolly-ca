@@ -348,7 +348,8 @@ export function createCaHandler(env = process.env) {
       writeResult(res, await route(env, req, url, path), cors);
     } catch (err) {
       // Message only, never the error object: a stack or a fetch error can carry
-      // the request URL, and enrollment URLs contain a single-use token.
+      // the request URL, and enrollment URLs carry a short-lived (10-minute)
+      // stateless HMAC token - time-bounded, not single-use.
       console.error('ca handler error:', err?.message || 'unknown');
       try {
         res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
