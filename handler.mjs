@@ -26,6 +26,14 @@ import { enroll } from './lib/enroll.mjs';
 
 const STATE_COOKIE = 'lolly_ca_state';
 const STATE_TTL_SECONDS = 600;
+// The completion page's BroadcastChannel only reaches the app when BOTH ends
+// share the same cross-origin-isolation status (same-origin channels are
+// partitioned by it) - the web shell ships COOP/COEP (plans/127), so the
+// popup's completion page must match. Harmless on non-isolated deployments.
+const ISOLATION_HEADERS = {
+  'cross-origin-opener-policy': 'same-origin',
+  'cross-origin-embedder-policy': 'credentialless',
+};
 const BODY_CAP = 64 * 1024;
 const STATE_TYP = 'lolly-ca/state'; // domain-separation tag (see tokens.mjs TOKEN_TYP)
 
@@ -122,7 +130,7 @@ export async function routeAuth(env, { provider, origin, redirectUri }) {
   if (provider === 'dev') {
     if (env.CA_DEV_FAKE_PROVIDER !== '1') return { status: 404, json: { error: 'unknown provider' } };
     const token = await mintEnrollToken({ email: 'dev@example.com', provider: 'dev' }, env.CA_SERVICE_SECRET);
-    return { status: 200, body: completionPage({ token, origin }), type: 'text/html; charset=utf-8' };
+    return { status: 200, body: completionPage({ token, origin }), type: 'text/html; charset=utf-8', headers: ISOLATION_HEADERS };
   }
   if (!OAUTH_PROVIDERS.includes(provider)) return { status: 404, json: { error: 'unknown provider' } };
   if (!configuredProviders(env)[provider]) return { status: 501, json: { error: `${provider} sign-in is not configured on this deployment` } };
@@ -167,7 +175,7 @@ export async function routeCallback(env, { provider, query, cookieHeader, redire
     return fail(401, err?.message || 'Could not verify your email with the provider.');
   }
   const token = await mintEnrollToken({ email, provider }, env.CA_SERVICE_SECRET);
-  return { status: 200, body: completionPage({ token, origin: state.origin }), type: 'text/html; charset=utf-8', headers: clear };
+  return { status: 200, body: completionPage({ token, origin: state.origin }), type: 'text/html; charset=utf-8', headers: { ...clear, ...ISOLATION_HEADERS } };
 }
 
 /** Magic-link start: mint a token for { email, provider: 'email' } and send it via Resend. */
