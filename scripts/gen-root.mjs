@@ -4,8 +4,8 @@
  * One-time CA root generation (see the operator runbook in
  * docs/content-credentials-identity.md). Writes into the CURRENT directory:
  *
- *   lolly-root-cert.pem  — public; commit it / paste into shells/web/src/ca-root.js
- *   lolly-root-key.pem   — THE secret; never commit, env var / password manager only
+ *   lolly-root-cert.pem  - public; commit it / paste into shells/web/src/ca-root.js
+ *   lolly-root-key.pem   - THE secret; never commit, env var / password manager only
  *
  * Refuses to overwrite existing files: a root swap invalidates every issued
  * cert and must be a deliberate act, not a re-run.
@@ -20,7 +20,7 @@ const keyPath = resolve(process.cwd(), 'lolly-root-key.pem');
 
 for (const p of [certPath, keyPath]) {
   if (existsSync(p)) {
-    console.error(`refusing to overwrite ${p} — move or delete it first if you REALLY mean to rotate the root`);
+    console.error(`refusing to overwrite ${p} - move or delete it first if you REALLY mean to rotate the root`);
     process.exit(1);
   }
 }
@@ -31,7 +31,7 @@ writeFileSync(keyPath, derToPem(pkcs8Der, 'PRIVATE KEY'), { mode: 0o600 });
 chmodSync(keyPath, 0o600); // belt-and-braces where the create mode is masked
 
 console.log(`wrote ${certPath}`);
-console.log(`wrote ${keyPath}  (mode 600 — the only secret that matters)`);
+console.log(`wrote ${keyPath}  (mode 600 - the only secret that matters)`);
 console.log(`
 Next steps:
   1. Paste the CERT PEM into shells/web/src/ca-root.js (public, safe to commit).

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 /**
- * The Lolly CA HTTP handler — one (req, res) function that runs three ways:
+ * The Lolly CA HTTP handler - one (req, res) function that runs three ways:
  * `node services/ca/server.mjs` locally, api/ca/[...path].js on Vercel, and
  * imported by tests (route logic is exported per-route so pure results are
  * testable without a socket).
  *
- * Routing is always on the full /api/ca/... path — the Vite dev proxy
+ * Routing is always on the full /api/ca/... path - the Vite dev proxy
  * preserves the prefix and Vercel mounts the function there:
  *
  *   GET  /api/ca/health
@@ -16,7 +16,7 @@
  *   POST /api/ca/enroll        { token, spki, pop, days? }
  *
  * Route functions return { status, headers?, json? | body?, type? } and
- * writeResult() serialises — no res access inside route logic.
+ * writeResult() serialises - no res access inside route logic.
  */
 
 import { buildAuthorizeUrl, configuredProviders, fetchVerifiedEmail, looksLikeEmail, OAUTH_PROVIDERS } from './lib/oidc.mjs';
@@ -41,7 +41,7 @@ const STATE_TYP = 'lolly-ca/state'; // domain-separation tag (see tokens.mjs TOK
 // real email to whatever (allowlisted-origin) caller asks, so an unauthenticated
 // loop could spam an inbox / burn the Resend quota. A warm-instance in-memory
 // map collapses repeats to one send per address per window. This is NOT a hard
-// limit (serverless instances aren't shared, and it resets on cold start) — real
+// limit (serverless instances aren't shared, and it resets on cold start) - real
 // rate limiting needs a durable KV/edge limiter; tracked as a follow-up. It does
 // stop the trivial single-process flood and is free. Belt: Resend's own limits.
 const EMAIL_COOLDOWN_MS = 60 * 1000;
@@ -57,10 +57,10 @@ function emailOnCooldown(email, now) {
 
 // Per-IP rate limit, in addition to the per-address cooldown above. The
 // per-address cooldown alone can't stop an attacker who walks a list of victim
-// addresses from one host — every address is "new", so each request passes. This
+// addresses from one host - every address is "new", so each request passes. This
 // caps how many /email/start sends a single client IP (x-forwarded-for first
 // hop) can trigger inside a short window, blunting inbox-bombing / Resend-quota
-// burn. Same caveat as the cooldown: this is PER-INSTANCE / best-effort only —
+// burn. Same caveat as the cooldown: this is PER-INSTANCE / best-effort only -
 // serverless instances don't share this map and it resets on cold start, so it
 // only stops a single-process flood. Durable cross-instance limiting needs a
 // shared KV/edge limiter; tracked as a follow-up.
@@ -68,7 +68,7 @@ const IP_WINDOW_MS = 60 * 1000;
 const IP_MAX_PER_WINDOW = 5;
 const ipHits = new Map();
 function ipRateLimited(ip, now) {
-  if (!ip) return false; // no usable client IP — lean on the per-address cooldown
+  if (!ip) return false; // no usable client IP - lean on the per-address cooldown
   // Opportunistic prune so the map can't grow unbounded on a long-lived instance.
   if (ipHits.size > 5000) {
     for (const [k, hits] of ipHits) if (!hits.some((t) => now - t < IP_WINDOW_MS)) ipHits.delete(k);
@@ -84,7 +84,7 @@ function ipRateLimited(ip, now) {
 
 /**
  * The popup/postMessage target and magic-link base must be ours. This is a
- * security check on the origin/redirect PARAMS, not CORS — the app is
+ * security check on the origin/redirect PARAMS, not CORS - the app is
  * same-origin with the service in both dev (Vite proxy) and prod (Vercel).
  * With the dev fake provider on, any http://localhost:* origin is allowed so
  * local setups need no env.
@@ -135,7 +135,7 @@ export async function routeAuth(env, { provider, origin, redirectUri }) {
   if (!OAUTH_PROVIDERS.includes(provider)) return { status: 404, json: { error: 'unknown provider' } };
   if (!configuredProviders(env)[provider]) return { status: 501, json: { error: `${provider} sign-in is not configured on this deployment` } };
   const nonce = randomB64u(24); // doubles as the OAuth state param + OIDC nonce claim
-  const pkceVerifier = randomB64u(48); // 64 chars — inside RFC 7636's 43–128
+  const pkceVerifier = randomB64u(48); // 64 chars - inside RFC 7636's 43–128
   const state = { typ: STATE_TYP, provider, origin, pkceVerifier, nonce, exp: Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS };
   const location = await buildAuthorizeUrl(provider, env, { redirectUri, state: nonce, nonce, pkceVerifier });
   return {
@@ -151,7 +151,7 @@ export async function routeAuth(env, { provider, origin, redirectUri }) {
  * Finish OIDC: state cookie must verify, match the provider and the echoed
  * state param, and still be fresh; then the code is exchanged server-side
  * for a VERIFIED email, which becomes a 10-minute enrollment token handed to
- * the opener via postMessage. Failures render a human-readable page — this
+ * the opener via postMessage. Failures render a human-readable page - this
  * runs in a popup, not an API client.
  */
 export async function routeCallback(env, { provider, query, cookieHeader, redirectUri }) {
@@ -159,7 +159,7 @@ export async function routeCallback(env, { provider, query, cookieHeader, redire
   const fail = (status, message) => ({ status, body: errorPage(message), type: 'text/html; charset=utf-8', headers: clear });
   const state = await verifyValue(parseCookies(cookieHeader)[STATE_COOKIE], env.CA_SERVICE_SECRET);
   if (!state || state.typ !== STATE_TYP) return fail(401, 'The sign-in state is missing or invalid. Start again from Lolly.');
-  if (typeof state.exp !== 'number' || state.exp * 1000 < Date.now()) return fail(401, 'The sign-in attempt expired — it only lives 10 minutes.');
+  if (typeof state.exp !== 'number' || state.exp * 1000 < Date.now()) return fail(401, 'The sign-in attempt expired - it only lives 10 minutes.');
   if (state.provider !== provider) return fail(400, 'The sign-in state does not match this provider.');
   if (!query.state || query.state !== state.nonce) return fail(400, 'The sign-in state does not match this browser.');
   if (!query.code) return fail(400, query.error_description || query.error || 'The provider returned no authorization code.');
@@ -195,7 +195,7 @@ export async function routeEmailStart(env, body, ip) {
   // Then cap total sends per client IP so one host can't email-bomb a whole list
   // of distinct addresses (each of which sails past the per-address cooldown).
   // Checked after the cooldown so repeat requests for one address don't burn the
-  // IP budget. An attacker hitting this is fine to tell — no victim info leaks.
+  // IP budget. An attacker hitting this is fine to tell - no victim info leaks.
   if (ipRateLimited(ip, now)) return { status: 429, json: { error: 'too many requests, please try again shortly' } };
   lastEmailAt.set(email, now);
   // The lifetime choice rides the token itself: the magic link may be opened
@@ -231,7 +231,7 @@ export async function routeEmailStart(env, body, ip) {
 
 // The client IP for per-IP rate limiting: the x-forwarded-for FIRST hop (the
 // original client as seen by the edge/proxy), falling back to the socket peer
-// for the local/test path. Best-effort — a spoofed XFF only lets a caller widen
+// for the local/test path. Best-effort - a spoofed XFF only lets a caller widen
 // their own budget, and the per-address cooldown still applies.
 function clientIp(req) {
   const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
@@ -248,7 +248,7 @@ function parseCookies(header) {
 }
 
 // https://host/api/ca/callback/:provider from the request itself. Behind the
-// Vite proxy the Host header is the Vite origin — correct, because the popup
+// Vite proxy the Host header is the Vite origin - correct, because the popup
 // goes through the proxy too. Vercel sets x-forwarded-proto.
 function redirectUriFor(req, provider) {
   const host = String(req.headers.host || 'localhost');
@@ -327,8 +327,8 @@ async function route(env, req, url, path) {
 /** Build the Node (req, res) handler over a given env (process.env by default). */
 export function createCaHandler(env = process.env) {
   // Is the CA configured to actually run on THIS deployment? It needs its
-  // service secret and/or root key. A deployment with neither — e.g. the
-  // blank-brand site (lolly.art), which carries no CA_* secrets — should not
+  // service secret and/or root key. A deployment with neither - e.g. the
+  // blank-brand site (lolly.art), which carries no CA_* secrets - should not
   // serve a CA surface (health/root.pem/enroll) that can only dead-end; 404
   // every route so the endpoint cleanly doesn't exist.
   const caEnabled = !!(env.CA_SERVICE_SECRET || env.CA_ROOT_KEY_PEM);
